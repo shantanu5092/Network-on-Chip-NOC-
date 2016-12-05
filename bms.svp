@@ -1,0 +1,665 @@
+//
+// This is a simple UVM mechanism to send data on the NOC bus
+//
+// It handles writes, reads, write responses, read responses
+// The write and read responses come from responses from memory, or the bmr channel
+//
+
+//
+// A simple message containing what is to be sent
+class bms_msg extends uvm_sequence_item;
+   `uvm_object_utils(bms_msg)
+   
+   NOC_CTRL ctl;   // the control byte. note: the len and addr size will be setup
+   int sillyness; // indicates lots of idles, will be inserted...
+   logic [1:0] rst;       // do a reset please... (Multiple reset checks).
+                            // 00 = no reset 01=reset 10= idle and clocks 11=reserved
+   reg [7:0] rid;   // the response id byte
+   int alen;
+   reg [31:0] addr;    // up to 12 in case
+   reg [15:0] len;  // the length field
+   reg [7:0] dt[0:147];  // bursts are limited to 128 bytes...
+
+   
+   function new(string name="bms_msg");
+     super.new(name);
+     sillyness=0;
+
+   endfunction : new
+   
+   function string toStr();
+     string cmdstr[]={"Idle","Read","Read_Response","Write","Write_response",
+        "Reserved","Message","End"};
+     string rv=$sformatf("-> %s lsize %d len %d ones %d asize %d addr %08h rid %02h",cmdstr[ctl.cmd],
+        ctl.len,len,ctl.ones,ctl.addrLen,addr,rid);
+     
+     return rv;
+   endfunction : toStr
+   
+   task setup(input NOC_CTRL ct);
+     ctl=ct;
+     sillyness=0;
+     rst=0;
+     alen=0;
+     addr=(ct.ones)?32'hffffffff:32'h0;
+     len=0;
+   endtask : setup
+   
+   task setupr(input reg[2:0] ct);
+     ctl=ct<<5;
+     sillyness=0;
+     rst=0;
+     alen=0;
+     addr=0;
+     len=0;
+   endtask : setupr
+
+endclass : bms_msg
+
+class rawnoc_msg extends uvm_sequence_item;
+    `uvm_object_utils(rawnoc_msg)
+    logic cmd;
+    logic [7:0] dt;
+    
+    function new(string name = "rawnoc_msg");
+      super.new(name);
+    endfunction : new
+
+endclass : rawnoc_msg
+
+class mon_slave extends uvm_monitor;
+    `uvm_component_utils(mon_slave)
+    
+    virtual nocif nif;
+    virtual crc_if cif;
+    
+    uvm_analysis_port #(rawnoc_msg) amsg;
+    rawnoc_msg msg;
+    
+    function new(string name="mon_slave",uvm_component par=null);
+      super.new(name,par);
+    endfunction : new
+    
+    function void build_phase(uvm_phase phase);
+      amsg = new("rawnoc_msg",this);
+    
+    endfunction : build_phase
+    
+    function void connect_phase(uvm_phase phase);
+//      `uvm_info("fun",get_full_name(),UVM_LOW)
+      if (!uvm_config_db #(virtual crc_if)::get(null, "uvm_test_top",
+        "crc_if", this.cif)) begin
+          `uvm_error("connect", "crc_if not found")
+         end 
+      if (!uvm_config_db #(virtual nocif)::get(null, "uvm_test_top",
+        "noc_if", this.nif)) begin
+          `uvm_error("connect", "noc_if not found")
+         end 
+    endfunction : connect_phase
+    
+    task run_phase(uvm_phase phase);
+      fork
+        forever begin
+          @(cif.cb);
+          msg = new();
+          msg.cmd=nif.CmdR;
+          msg.dt=nif.DataR;
+          amsg.write(msg);
+        end
+      join_none
+    
+    endtask : run_phase
+    
+    
+
+endclass : mon_slave
+
+
+class print_slave extends uvm_scoreboard;
+    `uvm_component_utils(print_slave)
+    
+    uvm_tlm_analysis_fifo #(bms_msg) bmsg;
+    bms_msg msg;
+    
+    function new(string name="print_slave",uvm_component par=null);
+      super.new(name,par);
+    endfunction : new
+    
+    function void build_phase(uvm_phase phase);
+      bmsg = new("bmsg",this);
+    endfunction : build_phase
+    
+    task run_phase(uvm_phase phase);
+      fork
+        forever begin
+          bmsg.get(msg);
+          `uvm_info("responses",msg.toStr(),UVM_LOW)
+        end
+      join_none
+    endtask : run_phase
+    
+
+endclass : print_slave
+
+class track_slave extends uvm_scoreboard;
+    `uvm_component_utils(track_slave);
+    
+    uvm_tlm_analysis_fifo #(rawnoc_msg) rmsg;
+    uvm_analysis_port #(bms_msg) wmsg;
+    
+    rawnoc_msg rm;
+    NOC_CTRL cb,wcb;
+    bms_msg bm;
+    int bpos;
+    int cntx;
+    
+    typedef enum reg[4:0] { TS_Idle,TS_RA,TS_RAD,TS_RL0,TS_RL1,
+        TS_RR,TS_RRD,TS_WA,TS_WAD,TS_WL0,TS_WL1,TS_WD0,TS_MSG,TS_WR,TS_WR1
+        } stv;
+    stv cstate,next_state;
+    
+    function new(string name = "track_slave", uvm_component par=null);
+      super.new(name,par);
+    endfunction : new
+    
+    function void build_phase(uvm_phase phase);
+      rmsg = new("rfifo",this);
+      wmsg = new("wmsg",this);    
+    endfunction : build_phase
+    
+    task sstate(input stv nstate);
+        next_state = nstate;
+        bm = bms_msg::type_id::create("msg");
+        bm.setup(rm.dt);
+        bpos=0;
+    endtask : sstate
+    
+    task nocmd(input reg cx);
+      if(cx) begin
+        OOPS::oops("Unexpected command flag in sequence");
+      end
+    endtask : nocmd
+    
+    task run_phase(uvm_phase phase);
+      cstate=TS_Idle;
+      fork
+        forever begin
+          rmsg.get(rm);
+           wcb=rm.dt;
+           if(rm.cmd==1 && wcb.cmd == C_Idle) begin
+             // Ignore idles on the return bus...
+           end else begin
+             next_state = cstate;
+//`uvm_info("debug",$sformatf("cstate %d",cstate),UVM_LOW)
+             case(cstate)
+               TS_Idle:
+                 if(rm.cmd==0) begin
+                   OOPS::oops($sformatf("Expected Idle, got a non command %02h",rm.dt));
+                 end else begin
+                   cb=rm.dt;
+                   case(wcb.cmd)
+                     C_Read: begin
+                       sstate(TS_RA);
+                     end
+                     C_ReadResponse : begin
+                       sstate(TS_RR);
+                     end
+                     C_Write : begin
+                       sstate(TS_WA);
+                     end
+                     C_WriteResponse : begin
+                       sstate(TS_WR);
+                     end
+                     C_Message : begin
+                       sstate(TS_MSG);
+                       bm.len=rm.dt&8'h1f;
+                       cntx=0;
+                     end
+                     C_End : begin
+                       OOPS::oops("Received an unexpected end command");
+                     end
+                     default: begin
+                       OOPS::oops($sformatf("Received unknown cmd %h",wcb.cmd));
+                     end
+                   
+                   endcase
+                 
+                 end
+               TS_RR : begin
+                 nocmd(rm.cmd);
+                 bm.rid=rm.dt;
+                 next_state=TS_RRD;
+               end
+               TS_RRD : begin
+                 if(rm.cmd==1) begin
+                   if(wcb.cmd == C_End) begin
+                     wmsg.write(bm);
+                     next_state = TS_Idle;
+                   end else begin
+                     OOPS::oops("Unexpected command code in read response");
+                   end
+                 end else begin
+                   bm.dt[bpos]=rm.dt;
+                   bpos=bpos+1;
+                   if(bpos > 128) OOPS::oops("Read Response greater than 128 bytes");
+                 end
+               end
+               TS_WA: begin
+                 next_state = TS_WAD;
+                 bm.rid=rm.dt;
+                 bpos=0;
+                 bm.addr = (bm.ctl.ones)?32'hffff_ffff:0;
+              end
+               TS_WAD: begin
+                 nocmd(rm.cmd);
+                 bm.addr = bm.addr & ~(32'h0000_00ff << (bpos*8));
+                 bm.addr |= rm.dt << (bpos*8);
+                 bpos=bpos+1;
+                 if(bpos > bm.ctl.addrLen) next_state=TS_WL0;                 
+               end
+               TS_WL0 : begin
+                 nocmd(rm.cmd);
+                 bm.len[7:0] = rm.dt;
+                 bpos=0;
+                 if(!bm.ctl.len) begin
+                   next_state = TS_WD0;
+                 end else begin
+                   next_state=TS_WL1;
+                 end
+               end
+               TS_WL1 : begin
+                 nocmd(rm.cmd);
+                 bm.len[15:8] = rm.dt;
+                 bpos=0;
+                 next_state=TS_WD0;
+               end
+               TS_WD0 : begin
+                 nocmd(rm.cmd);
+                 bm.dt[bpos]=rm.dt;
+                 bpos = bpos+1;
+                 if(bpos >= bm.len) begin
+                    wmsg.write(bm);
+                   next_state = TS_Idle;
+                 end
+               end
+               TS_WR : begin
+                 nocmd(rm.cmd);
+                 bm.rid=rm.dt;
+                 wmsg.write(bm);
+                 next_state = TS_Idle;
+               end
+               TS_RA : begin
+                 nocmd(rm.cmd);
+                 bm.rid=rm.dt;
+                 next_state=TS_RAD;
+               end
+               TS_RAD: begin
+                 nocmd(rm.cmd);
+                 bm.addr = bm.addr & ~(32'h0000_00ff << (bpos*8));
+                 bm.addr |= rm.dt << (bpos*8);
+                 bpos=bpos+1;
+                 if(bpos > bm.ctl.addrLen) next_state=TS_RL0;
+               end
+               TS_RL0: begin
+                 nocmd(rm.cmd);
+                 bm.len[7:0] = rm.dt;
+                 if(!bm.ctl.len) begin
+                   wmsg.write(bm);
+                   next_state = TS_Idle;
+                 end else begin
+                   next_state=TS_RL1;
+                 end
+               end
+               TS_RL1: begin
+                 nocmd(rm.cmd);
+                 bm.len[15:8]=rm.dt;
+                 wmsg.write(bm);
+                 next_state=TS_Idle;
+               end
+               TS_MSG: begin
+                 bm.dt[cntx]=rm.dt;
+                 cntx=cntx+1;
+                 if(cntx >= bm.len) begin
+                   wmsg.write(bm);
+                   next_state = TS_Idle;
+                 end
+               end
+               default begin
+                 OOPS::oops($sformatf("Morris, you didn't complete the state tracking %d",cstate));
+               end
+             endcase
+             cstate=next_state;
+           end
+        end
+      join_none
+    endtask : run_phase
+
+endclass : track_slave
+
+class noc_slave extends uvm_scoreboard;
+    `uvm_component_utils(noc_slave);
+    
+    typedef struct packed {
+      reg [31:0] msg,addr,expected;
+    } EMSG;
+    
+    EMSG efifo[$];
+    reg predict;
+    uvm_analysis_imp #(reg,noc_slave) setPredict;
+    
+    reg [31:0] sysMem[reg[31:0]];
+    
+    
+    uvm_analysis_port #(bms_msg) resp;  // send responses to this message
+    uvm_tlm_analysis_fifo #(bms_msg) rfifo;
+
+    uvm_analysis_port #(bms_msg) msgRR;
+    uvm_analysis_port #(bms_msg) msgWR;
+
+    bms_msg rmsg;
+    bms_msg bmsg;
+
+    function void write(reg rv);
+      predict = rv;
+    endfunction : write
+
+    task setMem(reg [31:0] addr, reg [31:0] dt);
+        sysMem[addr]=dt;
+    endtask : setMem
+    
+    function reg [31:0] getMem(reg [31:0] addr);
+      return sysMem[addr];
+    endfunction : getMem
+    
+    function reg exists(reg [31:0] addr);
+      return sysMem.exists(addr);
+    endfunction : exists
+    
+    task setExpected(reg [31:0] adr, reg [31:0] msg, reg [31:0] er);
+      EMSG em;
+      if(!predict) begin
+        em.msg=msg;
+        em.addr=adr;
+        em.expected=er;
+        efifo.push_back(em);
+      end
+    endtask : setExpected
+    
+    function new(string name="noc_slave",uvm_component par=null);
+        super.new(name,par);
+        predict=1;
+    endfunction : new
+    
+    function void build_phase(uvm_phase phase);
+      resp = new("resp",this);
+      rfifo = new("rfifo",this);
+      msgRR=new("msgrr",this);
+      msgWR=new("msgwr",this);
+      setPredict=new("predict",this);
+      sysMem[0]=32'h33221100;
+      sysMem[4]=32'h77665544;
+      sysMem[8]=32'hbbaa9988;
+      sysMem[12]=32'hffeeddcc;
+      sysMem[16]=32'h13121110;
+      sysMem[20]=32'h17161514;
+      sysMem[24]=32'h1b1a1918;
+      sysMem[28]=32'h1f1e1d1c;
+    endfunction : build_phase
+   
+   
+   task procWrite(bms_msg rmsg);
+     reg [31:0] wk;
+     int cntr;
+     for(cntr = 0; cntr < rmsg.len; cntr=cntr+4) begin
+       wk = { rmsg.dt[cntr+3],rmsg.dt[cntr+2],rmsg.dt[cntr+1],rmsg.dt[cntr]};
+       sysMem[rmsg.addr+cntr]=wk;
+     end
+     bmsg=new();
+     bmsg.rid=rmsg.rid;
+     bmsg.setupr(C_WriteResponse);
+     resp.write(bmsg);
+   endtask
+   
+   task procRead(bms_msg rmsg);
+     reg [31:0] wk;
+     int cntr;
+//     `uvm_info("debug",$sformatf("pr -> %s",rmsg.toStr()),UVM_LOW)
+     bmsg=new();
+     bmsg.setupr(C_ReadResponse);
+     for(cntr=0; cntr < rmsg.len; cntr=cntr+4) begin
+       wk = sysMem[rmsg.addr+cntr];
+//       `uvm_info("debug",$sformatf("     RR ix %x data %08h",cntr,wk),UVM_LOW)
+       bmsg.dt[cntr]=wk[7:0];
+       bmsg.dt[cntr+1]=wk[15:8];
+       bmsg.dt[cntr+2]=wk[23:16];
+       bmsg.dt[cntr+3]=wk[31:24];
+     end
+     bmsg.len=rmsg.len;
+     bmsg.rid=rmsg.rid;
+//     `uvm_info("debug",$sformatf("Returning %s",bmsg.toStr()),UVM_LOW)
+     resp.write(bmsg);
+     
+   endtask
+    
+
+   task procMessage(bms_msg msg);
+     EMSG em;
+     reg [31:0] wk;
+     if(efifo.size() < 1) begin
+       OOPS::oops("message when none expected");
+     end else begin
+       em = efifo.pop_front();
+       if(msg.len != 4) begin
+         OOPS::oops("Returned message not 4 bytes data");
+       end
+       wk={msg.dt[3],msg.dt[2],msg.dt[1],msg.dt[0]};
+       if(wk != em.msg) begin
+         OOPS::oops($sformatf("message rid didn't match got %08h exp %08h",wk,em.msg));
+       end else begin
+         if( sysMem[em.addr] !== em.expected) begin
+           OOPS::oops($sformatf("CRC result didn't match %08h expected %08h",sysMem[em.addr],em.expected));
+         end
+       end
+     end
+   endtask : procMessage
+
+   task procRR(bms_msg msg);
+     msgRR.write(msg);
+   endtask : procRR
+
+   task procWR(bms_msg msg);
+     msgWR.write(msg);
+   endtask : procWR
+     
+
+   task run_phase(uvm_phase phase);
+     fork
+       forever begin
+         rfifo.get(rmsg);
+         case(rmsg.ctl.cmd)
+           C_Read: begin
+//             `uvm_info("debug",$sformatf("ProcRead A %08h L %d",rmsg.addr,rmsg.len),UVM_LOW)
+             procRead(rmsg);
+           end
+           C_ReadResponse: begin
+             procRR(rmsg);
+           end
+           C_Write: begin
+             procWrite(rmsg);
+           end
+           C_WriteResponse: begin
+             procWR(rmsg);
+           end
+           C_Message : begin
+//             `uvm_info("debug","Got a message",UVM_LOW)
+             procMessage(rmsg);
+           end
+           default : begin
+             OOPS::oops($sformatf("Unprocessed noc_slave %d",rmsg.ctl.cmd));
+           end
+         endcase
+       end
+     join_none
+   
+   endtask : run_phase
+
+   function void check_phase(uvm_phase phase);
+//     `uvm_info("debug","In the slave report phase",UVM_LOW)
+     if(efifo.size()!=0) begin
+       `uvm_error("error",$sformatf("%d messages not processed",efifo.size()))
+     end
+   endfunction : check_phase
+
+endclass : noc_slave
+
+
+
+
+//
+// This is the driver for now...
+//
+
+class noc_driver extends uvm_driver #(bms_msg);
+
+`uvm_component_utils(noc_driver)
+
+uvm_analysis_port #(expwrite) we,re;
+
+uvm_tlm_analysis_fifo #(bms_msg) backDoor;
+
+uvm_analysis_port #(reg) bm_mode;
+
+bms_msg req,req2;
+
+virtual crc_if crc;
+virtual nocif noc;
+int reqwait;
+reg predict;
+
+function new(string name = "noc_driver", uvm_component parent = null);
+  super.new(name, parent);
+  predict=1;
+endfunction
+
+function void build_phase(uvm_phase phase);
+    we = new("wmsg",this);
+    re = new("rmsg",this);
+    bm_mode = new("bm_mode",this);
+    backDoor = new("backDoor",this);
+endfunction : build_phase
+
+function void connect_phase(uvm_phase phase);
+      if (!uvm_config_db #(virtual crc_if)::get(null, "uvm_test_top",
+        "crc_if", this.crc)) begin
+          `uvm_error("connect", "crc_if not found")
+         end 
+      if (!uvm_config_db #(virtual nocif)::get(null, "uvm_test_top",
+        "noc_if", this.noc)) begin
+          `uvm_error("connect", "noc_if not found")
+         end 
+endfunction: connect_phase;
+
+`protected
+ObDGBdcUDLAQ8U0ZQ1g7;>\gQH2G)C+/N=F2@A^=dBOFC,L+&G@@.)0SgQ9RR_NF
+N1]FX5-d964E2Q;,9<S1H[](Gc(XXIQI;1Y\[I5abf05Vd(J(UB)Hb,(J/:X77fY
+6<,/Db)-I9\XAFR8\Z-DdQUQ)Z,:8HSDK(WRF.?HaTD]M9=)L\EE2+#<L#AH3=X5
+a,OJ2?g^<5BFQb[27M<?V,\,SFI-0JdM7WPFZMT]]/F<d\TK^J11FHYOIW[V(W0a
+6cJ71f#1cZ5HBa)S(PUN=-5-N<P=IB#KSf)P]#6^U#B3eO+X?OBdP:V#&;7cMA8d
+N4KKHM]6/BGFc5#-W>VSFCbQ]]g&c_V1g<:56#b49HaX_BW]Ha3\dF5F)(]B;,J9
+4+5E:>UIHO+Oa@Y;CA<7@2fb<3dX57.K^7]0b[.B[Q#_2/V;b)I930?^B,;^_ec8
+2+TdFYI5g-cLZMCYcO=X9-g@Id2W/1TU(^@[PcR?eT.6.V@UUYZ50=b9ME#D-\(D
+;^#8WUPBc4YW=2VR7R91GT?1J\g@R>:>J2^25(XA>KFAQ3C0_&8RWIGCD[/LK<V#
+=&POCV[)Q<RLAbD@E5(-XIgQ.G+bPZYI[VCK_baFVW2&Y-Y30UFA\/>Gc>HW_F/W
+CGD&5AgU0U&+Y:MQ1Zc6>f,HLK=N.8;X-GW3W8UI2b##g8K/,Q6Vd-10IRV#0=dE
+cWW>LYIPQdc9.&9SUdL9PCa-#/Yf8@NSe/9\H\Zg;66O5gUPU7WC0^LdI]\2[T=F
+^=(R9YHJ/>H@X:](D?)T0L,P>5CY3:<NFF<7f2E_b+I^GB+40De>^L?47YR5)K@X
+-gddUI30?P8?86:AD>WZTF5&Y5D43HTS)9>RV?]O9IIc8:I><GX6Y-a(#3E2fZYH
+EL_Z_G\HDbM9Naa,IQ,EDg__E(V1Vd#68#=&7)K\g80&_9IW+f(]\5WbQ=^5f6+N
+.EOD)497>P#CH?-b8)7ZI6FK4Z)J5CE#8)XfW3Y/92MeLY-2+]XGc\aeC-&GY4C@
+[PdM]KZH3]29GcQ/-eU1FV/P^).IXH<05O=GE.5S]EgF<JX^SP,B?G]357R)55ba
+:]f.LF@d3EgTIKf)a[8fCfgD\2@CC3J/0a1-J,X80+T3SOK-?^D?C^.Od#WW<B;f
+:/(/N)2>);\gS#L5QA8Q4;,4DBDYY[Q8>(@Wb6fAWPLD5B[e/b/GQEKO9Eb:SLN2
+c2)E^dB2_BEIK^_>IbAF.U/0.1&<EgdZEK.KQ^B)aTGK9IYCHU/EX+eF/#;BR<G_
+[2-\92>U<bcZ-aQ9)[H:eHLTZ(A6_8TLJab[_A]#(CLBR/1&/:E?MZHX(-D7B\cA
+gaaRF@\1M&@U]Gf6R?Rc0RMQf,,efV+=Q2\IBJAQZ7LQ]SdLAQYZ]6JZ;PAC(d8C
+,a-Bf=bGJQM:?=ICeeSg@QF.(N?;PY46c-eR:.D18c/^Hc7+G\_)BYeP;+2/#P>/
+7P@9#HH[RMT]Gcad.-66S@f#2XdeMH;98M2[.aL0NRag9H)<S@@O,LWTTDNW9>=S
+2)?7U4UcCXI63QWX\,\;.VDfAJc@XEKK.>.c#NM>/BGa)IVHGXQ?WF7DH<QWaOJF
+9:<D2acR&b?[dA[IS&6g.I:a<bBf::)K/U=::<P^[dBRQHESNE&EH.aYd1>6DeZ9
+fCA1e-OW3Kd=9GcYM6-C(:S]_EQY>PA+U2L;6ffeK[7U?)D^#7K[1X>\WbXTA+fN
+E]c9J_I(9=H8Cg;-K<<97?)[)g696Fbe@ZJ/?6>d)4XZ:5^ab3KW=+P=BCcVR5Ag
+3g7.+&I7Y/6(e8:GPd>(5Z:^<S_Y7[#V#M+1-:Vb^3NF9Y./@:R/G31E_5:#L.M_
+^,:3T+V?#VDHUP]:/b_@/VW>UgJHWTAJ/#\gK:?aX8YPKOfBfZ7b0>K7TPV@;P1f
+eZJV>Z#H1-Rd;N/c?>FLMfPc=>3&/ZS<Y<7cb&O6I]TT[0^B=gNSP;8X)C&+TD_d
+&9,0gG#?#gaKHA?QX5PbJSMa<0JH)1M3E1g>L1])c^&Td/60H?>#bJP+48fDg3=8
+L\Bb:I;.-M5@GQ7C\V?W,gR4IYa1cdM/0d.3:BINF&CUE@H1V^WDH?_f<J<8\g(N
+IMQ-7U(F=P\7d[Uc=D07@H6_9a,RFIXOT^PZ0UMSfd3ZJE]R<&3OfJ5K>g,U9@/#
+cbcBYd4>7MLDc^[QN&NP0b^/AaFeLTF#OdcB0.?bK3ACC^AgD.F0V#I^X(f0Q0eD
+BCLU0_(_[c28@OKQdOA,gQX/D+,>N,9L2c/6<M4T8XE54P2;;1RRNFa=@DQaV3\)
+&;V&>6CQ/+;CNB]1T1c\NcO1EBY<0DTC.fQLEV#aH=OWG4.70^H-\DW3//[<OQdR
+SL>59V=SD]aa,Y[APd8Q;+FNFg(f@)N,9/@D;B\?fW(P@TA)+_N/MbJ1,E>71S6-
+76]4SG+OJ&ES=(AIZOE=c;3<,G[\F2:eO,e_?R/X7PVM#\:=EGPVK<20)6b>NQ\-
+X@JQB;9C.LIcIA]M0<_E8#dDZ&51=]0_^WD[]R@?;Hc#QEB<d)KWV=&gO@P/>EFK
+)=/#2a#IHRUOR)GaLRPX\cU[01B::>@]Oe=C\VWW)5c6.(<T9UUXPRZY9DVda->J
+]Y,HcN2.SAMR=BHSMT?T,#3K?L02a]DMY3ELe2\dSU>VcAZB>S\[=KER5UH6;)^Y
+L(6=;7IIS#@P-&6;1?T<2LFE@Jg73=O2HD+g1EODQ:YLY[A9;6>RIQL(H1WHI.9;
+1OM_L:IT\W96H6GFMCND86GH[58KS)?)7XY131\E\BS8:/cfLPUFUPM\FO-fSfWT
+DCBg)LXAN8a)Q<RZKfVa_]e<bE0/cad(YBMZN;2FTGOKYf<\d:[YN(@@T,W-A,N(
+YH)[ON@.Y^?9V3.]6RDRFL:VDP]\8C[?OcW3.H?=-&9&ZE0eWBCD/?.f;e-bHLQ4
+:8g>=<:1I/OA1W).c[8I[4@ZH&<R);>V3[6>^JJ31;ZN-KFcZW>ZCIZTaT,fQP7D
+4_<f=F>H-<O6K\IPY0KcS3LEd)>D<bU=Sg3,:IF_2V/D0P<KaY8Ub^f,75L,KLOg
+2C(W2Ke&12G(;&(LaX&3R4<K5cTd0I:cadS5\5aXBA,7\A7Vb6C^SF,\RfA4JG23
+YGaQ>M>b,1PT5HEO>QR72aQ-&fK28/RY4-C&5,\O7af:PU0:8Nf=KD,ZS)H+..\,
+N.7+3.08B-+@P=,6@E^L9K,D]dW6E<0GgDK,M9?MgP^LZH,,-@P3YA193S7_<?;D
+WRZ1c\315&2/J)\_+H9@<8B:dY8B#gO\H5O>-9WC+,YUUgLU0>#0Bb&76S&7.YT]
+K=?Q>]>FSB1RZ.5b4If;/08#B^beU_I]H\&cgJ[aFPQA:Ue2,C)>05g[0@aUU9_\
+\CW;SB>H>38OQF1IG)a&2W(TM+fIBbR^M;[H>>/Q;/b#7)T+T<<B87A/UVXH0,0W
+f97>K4IJ&MEYJa([NM60BE+&OLg8LfR:+V84PDZ[_HQE8G^/)JNU8Be0UTfB9G2-
+#Ng.aX=0FIES_S\b:0RSe+2bb0bT##d1#,Nbd>35]B6@eH0_6@0B,R=FE9F>)-&,
+>ZXcG2.?\WTEO=\W[1]WYdV63]TBbM@If\Y-3dR3+\0O8Q4)2]XV48K+PP^bJ\&]
+D<].W/dd3.NOA/JJFRK,0Re[[B0=9^FZ8>7O&<&585&#=X&85\?V++@(]4A=+?dI
+_8<UJL@7EZF[<5T3B@c]<7GC(cV)&T#X/.d^;(@:T8^0E_?[4G/=@<E?V+e#@f/;
+W0)=];[;^=(LU,RX?Lec+JbMec^BUH?c\6XEfJNfH4_.1S9HX;<5Ka1]2X<4CLY7
+K&\=g&FE_5C;#NH[U,L\-=c0JGL^,;:<WA6I9SZAHKKQHD7+:O@R>8](KRRFXRJ]
+#_7fgW-]H4R\T58@38EQYU#X;N.31@UNT1F^3-@ZBU4SXc+]BVP+CNf++0KEN3.Q
+D/J[.#2ZYO+LdCZU0H(6;LH<[N0)1Z^M,G2.^VfV2E1Z@_VREfM/XZ<8XL3fK:@#
+?<]3]::>EHBJdEZ2Ra3Q^<MRH3DgDbYVL;N7ACL^.]0?3I2-/e2cC8gTUF6MQIM_
+5W?QI^M6C]W?;3Pac4.4Z&aF+>8J_@ZOBF7N(_Y4e.4SOOMCE4EIDbB8>]CM/[]&
+V_I.bNLY:(]dW+ccTId>P3)ZO^adRKF^W2gacMPBdMg5I3baDb/FT]CYXR:CTYc.
+?4<\U[ObJ;RcBR145?#>=0G./=AgNJ5.FcBPeSP-&1RB^,2L_P-XTCd-4RY3/Xd3
+fZG;.e+4dGZ=5M\17C3@@bPYXaR++=e^_WL/e.KZ?96]VCX0/.ZR?K[_6>611)=0
+U+8OS4^\6V_(SYY8K-[V>[&&E[&>STX2cVNI_F2JP/Ld\?Z?g7&Pe[+^-?fe[?gD
+C0VCC^HB7M\JPO(6fXL^)-b)UQDH;#OR#d-WT-ZLEPMIMYd1;;2NFW0_,+7af=R[
+=WOca5:c-_=?:NNZ1?;2@[.SZK,D04=84Y-6aUbL2(a7K,:Z+_fM3bRR(WL@aLbE
+TK[(90fF)GR54DN5G\UQ1U]ge@]AaPaM2egeL>2Z_f1#NZbcTN0>KE2,SS.Q7dKJ
+R=+EUM>eYf>B366#5LU8g6>7>/[Z&M2:^#?&/FNPF27+E#=FGISfA0BeJRB,cK8-
+L8]2e]Ng9X-+=/G=/EbYQ>BeM=^dc_:Y)d4_Mg8-JCBD&2@)M:\DUBT)<WX.U)T)
+OR.@?U@KgR4QG8^beWAR,W4/Web)-Qf5X>QOFecC3/HBJdXaGQ?_406X_TCfWKN3
+O0<U9X162+V1&#CC[S(5/UDV^bJPIU6G/#>L01&5:KS1G0Q203?^\6,CC>b[1:dO
+2_I7fI7SDI.875LfL]4#^690:c]#+M8d?H_XOSJF@@.8Ofb,=cEGKVUWfQ@IGUeE
+T<,4@#(Rc8^=gSYK,B7QA-6E=eTO.B84CdEOWX-bUU>MU3JR>L.aT2_)HAXA.0)]
+KCES&[e64>]B0\@LW@)^^<4\F;0YR=VX)#M/BKW^gD+#K>TG+DMZ=JG5BaOJJ9G<
+X@4NY-=Ud<]:@L(&g@&f(&:.SUUa)A]aII^BZ=1P&[K-2:0,-KHH=>afdC]5C&:>
+Q^1,aIa2=f4R;B;U2d&9f@8aWF<PT7_?#9B7SQR;?]KVPBWOc?g9d3^[U/7PF4Gg
+2?I\f[@AgHB6Be_R-<dCTQC/f+-L)c^[;D62\gSEaH1fQI/1>8:\/@+9OA[Z\XR8
+=YO6LXV;0AM]V5.Q,Ug7e>b1E8K.LZJZ00&RL(gS<68g6a370^e<0M.3/(/-.8+W
+#U_A;>aZc(0MGQ]@@J>94dE=?9?_]+;aL@AX=@F(U<9#bdO42a3MN7dG4dMaV:#L
+E1(H/,GN,N[>c@X4V:FU0+3HN><XEA2<3\Qa:dT2dMcGX4VBYTIOE/,<O-I3-bE)
+X-?fUJZO5Rc2IJ.C(,Lb;@P_QSPH(c&1f_AfA63ef9VZ\/I6P+O)d(YF9,YPS>>B
+.XVG/W_EZJQcMY+d>./@g>?a]0,dg>78/b@]A\O-9>a&QMP=FVWZL\C5Re1@:G2K
+TFY]eIccB])6=5b.I(^#+_>YMa347E0>6C\@BPU(7Yc1a4:YSTOT.eEbUdKb6?>W
+XcFC=R,G;Ga)U-QO>W.^P-</0Xf@DID86_R8],/Z4#:O\&J3c[N11P(>F:dSMC/;
+)Y5S,^SWSYG#7[V=P&4)7PL?3GQ;HW33K5R]4?8(KP].K1WbHeCB[]S_D#-^U6W/
+EKN^MbC=\DAFM<3?T=f)D:XM^eSgg8DJ76Y:]bC2.,4NL^FE5A1[g5.PS2>&P@UM
+-#Ye]13G>EeJdcS-;eK-MRZ6,5>F&EL?#F+L?1OJLD[d.Xc>5N(DZN^\N(83G5I;
+D9TZ9f0=R>QR(G4))0C70=4X;SE2P0R6>3^AIFWRDB6NOeRS]_0_FGg:g<bNPYBE
+fIR2PXb>/,<95KOYUQ;a5+E11-eOR\@DfHeYF(VbK<Q8c<+;Z)L6;V,.=JOBeCf_
+>07K=:B7W)8BfMK;_:TJ:f?F80a]:>6,V2K-dAZ-<,C,#L^28<=IE.1>RfY\MPWC
+[R)QCK@D3,/G<:,G,Wgf_LW1HDPa&f,:AZ/P]XPKHLT?bY.;P=70[5EgO[<()d[G
+3=fSCN7\)6V].A2I<DM:6PQJIg\<bR75>.D]D;4+RPN_?d)8gCPJT6&>e[L?BQSV
+Nb,K^L-+B&P.2I/7V:<FFAQJ6$
+`endprotected
+
+
+
+endclass: noc_driver
