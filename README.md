@@ -8,4 +8,4 @@ The Network on a chip is a pair of low pin count uni-directional bus. The data i
 
 * The commands used are specific to the Synopsys tool (VCS tool for simulation and design compiler for synthesis) and might not run on other tool.
 
-* The sv_uvm script will run the simulator. Use command "./sv_uvm tbcrc.sv"
+* The sv_uvm script will run the simulator. Use command "./sv_uvm tbcrcn.sv"
